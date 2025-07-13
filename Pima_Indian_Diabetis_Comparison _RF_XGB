@@ -1,0 +1,1263 @@
+library(dplyr)
+library(lattice)
+library(tidyverse)
+library(caret)
+library(recipes)
+library(pROC)
+library(ranger) 
+library(xgboost)
+library(mice)
+library(caret)
+library(recipes)
+library(reshape2)
+library(ggplot2)  
+library(naniar)
+library(visdat)
+library(vip)
+library(patchwork)
+
+# Data available on kaggle:
+# https://www.kaggle.com/datasets/uciml/pima-indians-diabetes-database/data
+
+pima_data <- read.csv("diabetes.csv", header = TRUE)
+
+
+# Outcome(Diabetis) Proportion
+sum(pima_data$Outcome == 1)/length(pima_data$Outcome)
+sum(pima_data$Outcome == 0)/length(pima_data$Outcome)
+
+
+# Missing Data
+sum(pima_data$Glucose == 0)
+sum(pima_data$BloodPressure == 0)
+sum(pima_data$SkinThickness == 0)
+sum(pima_data$Insulin == 0)
+sum(pima_data$BMI == 0)
+
+
+# 0 entries into NA
+pima_data$Glucose[which(pima_data$Glucose == 0)] <- NA
+pima_data$BloodPressure[which(pima_data$BloodPressure == 0)] <- NA
+pima_data$BMI[which(pima_data$BMI == 0)] <- NA
+pima_data$SkinThickness[which(pima_data$SkinThickness == 0)] <- NA
+pima_data$Insulin[which(pima_data$Insulin == 0)] <- NA
+
+
+# Class proportions
+table(pima_data$Outcome)
+prop.table(table(pima_data$Outcome))
+
+
+# Missing data heatmap
+vis_miss(pima_data, sort_miss = TRUE) 
+
+
+# Correlation Heatmap
+# Correlation Matrix without order
+cor_mat <- cor(pima_data, use = "pairwise.complete.obs")
+
+# Correlation Matrix ordered by correlation between Outcome
+cor_with_outcome <- cor_mat["Outcome", -which(colnames(cor_mat) == "Outcome")]
+
+# Get order by absolute value
+ordered_vars <- names(sort(abs(cor_with_outcome), decreasing = FALSE))
+
+# Put Outcome last for both rows and columns
+ordered_vars_plus_outcome <- c(ordered_vars, "Outcome")
+cor_mat_ordered <- cor_mat[ordered_vars_plus_outcome, 
+                           ordered_vars_plus_outcome]
+
+
+colnames(cor_mat_ordered)[2] <- "DPF"
+rownames(cor_mat_ordered)[2] <- "DPF"
+
+melted_cor <- melt(cor_mat_ordered)
+
+# Correlation Heatmap Plot
+ggplot(melted_cor, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name="Correlation") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 12), 
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 12)
+  ) +
+  labs(x = NULL, y = NULL)
+
+
+
+# Boxplots
+par(mfrow = c(2, 4))
+boxplot(pima_data$Glucose) 
+boxplot(pima_data$BloodPressure)   
+boxplot(pima_data$BMI)         
+boxplot(pima_data$SkinThickness)   
+boxplot(pima_data$Insulin)        
+boxplot(pima_data$Age)
+boxplot(pima_data$Pregnancies)
+boxplot(pima_data$DiabetesPedigreeFunction)
+par(mfrow = c(1, 1))
+
+
+
+# Finding the outliers of Insulin and SkinThickness
+sort(pima_data$SkinThickness)
+which(pima_data$SkinThickness == 99) # 580
+sort(pima_data$Insulin) 
+which(pima_data$Insulin == 846) #14
+which(pima_data$Insulin == 744) #229
+which(pima_data$Insulin == 680) #248
+
+
+# Boxplots Insulin and SkinThickness
+par(mfrow = c(1, 2))
+
+boxplot(pima_data$SkinThickness, main = "SkinThickness", col = "salmon")  
+highlight_idx <- c(580)
+points(x = rep(1, length(highlight_idx)),  
+       y = pima_data$SkinThickness[highlight_idx],            
+       col = "red",                        
+       pch = 1,                          
+       cex = 1)   
+
+boxplot(pima_data$Insulin, main = "Insulin", col = "skyblue")  
+highlight_idx <- c(14, 229, 248)
+points(x = rep(1, length(highlight_idx)),  
+       y = pima_data$Insulin[highlight_idx],            
+       col = "red",                        
+       pch = 1,                          
+       cex = 1)                         
+
+
+par(mfrow = c(1, 1))
+
+
+# Outliers removal
+pima_data$SkinThickness[which(pima_data$SkinThickness == 99)] <- NA
+pima_data$Insulin[which(pima_data$Insulin == 846)] <- NA
+pima_data$Insulin[which(pima_data$Insulin == 744)] <- NA
+pima_data$Insulin[which(pima_data$Insulin == 680)] <- NA
+
+
+
+# MICE impuation
+set.seed(123)
+imp <- mice(pima_data, m = 5, method = "pmm")
+
+# Extract the completed dataset from imputation 1
+pima_complete <- complete(imp, 1)
+
+# Imputed Data
+pima_data <- pima_complete
+
+
+# Stratified Splitting
+set.seed(123)
+pima_data$Outcome <- as.factor(pima_data$Outcome)
+train_indices <- createDataPartition(pima_data$Outcome, p = 0.8, list = FALSE)
+pima_train <- pima_data[train_indices, ]
+pima_test  <- pima_data[-train_indices, ]
+pima_train 
+pima_test
+
+prop.table(table(pima_train$Outcome))
+prop.table(table(pima_test$Outcome))
+
+length(pima_train$Outcome)
+length(pima_test$Outcome)
+
+
+
+##############################################################################
+#
+# Hyperparametertuning Random Forest
+#
+##############################################################################
+
+# Convert Outcome to a factor with names(string)
+pima_train$Outcome <- factor(
+  pima_train$Outcome,
+  levels = c(0, 1),  
+  labels = c("NonDiabetic", "Diabetic") 
+)
+
+pima_test$Outcome <- factor(
+  pima_test$Outcome,
+  levels = c(0, 1), 
+  labels = c("NonDiabetic", "Diabetic")
+)
+
+pima_train$Outcome
+pima_test$Outcome
+
+
+# For better reproducibility
+set.seed(123)
+
+# Class weights train set
+w_train0 <- length(pima_train$Outcome)/
+            (2 * sum(pima_train$Outcome != "Diabetic"))
+w_train1 <- length(pima_train$Outcome)/
+            (2 * sum(pima_train$Outcome == "Diabetic"))
+
+
+
+
+# Hyperparameter grid for Random Forest
+rf_grid <- expand.grid(
+  mtry = c(2, 3, 4),  
+  splitrule = "gini",       
+  min.node.size = seq(10, 160, by = 10),      
+  num.trees = c(100, 500, 1000),
+  auc = NA,     # Track AUC for each combination
+)
+
+
+rf_grid
+
+
+set.seed(123)
+# Loop with train()
+for (i in seq_len(nrow(rf_grid))) {
+  set.seed(123)
+  # Train model with current hyperparameters
+  fit <- train(
+    Outcome ~ .,
+    data = pima_train,
+    method = "ranger",
+    metric = "ROC",    # Optimize "ROC"
+    tuneGrid = data.frame(                  
+      mtry = rf_grid$mtry[i],
+      splitrule = rf_grid$splitrule[i],
+      min.node.size = rf_grid$min.node.size[i]
+    ),
+    trControl = trainControl(
+      method = "cv",  # 5-fold cross-validation                     
+      number = 5,
+      classProbs = TRUE,    # for AUC                  
+      summaryFunction = twoClassSummary,   # for AUC  
+      verboseIter = FALSE
+    ),
+    num.trees = rf_grid$num.trees[i],
+    importance = "none",                   
+    class.weights = c(w_train0, w_train1),
+    seed = 123
+  )
+  
+  # Best AUC from cross-validation results
+  rf_grid$auc[i] <- max(fit$results$ROC)    # for AUC
+}
+
+rf_grid
+
+# Rank models by AUC
+rf_grid %>%
+  arrange(desc(auc)) %>%
+  head(50)
+
+
+# Class weights test data
+w_test0 <- length(pima_test$Outcome)/
+            (2 * sum(pima_test$Outcome != "Diabetic"))
+w_test1 <- length(pima_test$Outcome)/
+            (2 * sum(pima_test$Outcome == "Diabetic"))
+
+
+
+# Final Random Forest model
+final_pima_rf1 <- ranger(
+  formula         = Outcome ~ ., 
+  data            = pima_train, 
+  num.trees       = 100,  
+  mtry            = 3,
+  min.node.size   = 100,
+  class.weights = c(w_test0, w_test1),
+  #respect.unordered.factors = "order",
+  seed            = 123,
+  importance = "impurity"
+)
+
+
+# With class probability for AUC-ROC
+final_pima_rf2 <- ranger(
+  formula         = Outcome ~ ., 
+  data            = pima_train, 
+  num.trees       = 100,
+  mtry            = 3,
+  min.node.size   = 100,
+  probability     = TRUE,
+  class.weights = c(w_test0, w_test1),
+  seed            = 123,
+  importance = "impurity"
+)
+
+
+final_pima_rf1
+final_pima_rf2
+
+
+######################################
+
+# Default model Random Forest
+
+#final_pima_rf1 <- ranger(
+  #formula         = Outcome ~ ., 
+  #data            = pima_train, 
+  #class.weights = c(w_test0, w_test1),
+  #seed            = 123,
+#)
+
+
+######################################
+
+
+# Using orginal data with orginal labels for Outcome
+pima_train <- pima_data[train_indices, ]
+pima_test  <- pima_data[-train_indices, ]
+
+
+
+###########################
+# Prediction using test set
+preds1 <- predict(final_pima_rf1, data = pima_test)$predictions
+
+# Using orginal labels
+preds1 <- factor(preds1, levels = c("NonDiabetic", "Diabetic"), 
+                 labels = c(0,1))
+
+
+# Confusion matrix test set
+cm <- confusionMatrix(preds1, pima_test$Outcome)
+cm
+
+# F1-score of test set
+precision <- cm$byClass[3][1]    #
+recall <- cm$byClass[3][1]       
+F1 <- 2 * (precision * recall) / (precision + recall)
+names(F1) <- "F1"
+F1
+
+# AUC-ROC using class probability
+preds_auc <- predict(final_pima_rf2, data = pima_test)$predictions
+preds_auc
+
+colnames(preds_auc) <- c(0,1)
+
+roc_od <- roc(pima_test$Outcome, preds_auc[, "1"],)
+roc_od
+
+# Plot ROC curve
+par(mfrow = c(1, 1))
+plot(roc_od, 
+     main = "ROC Curve for Random Forest Model",
+     print.auc = TRUE, 
+     legacy.axes = TRUE)
+
+
+
+############################
+# Prediction using train set
+preds2 <- predict(final_pima_rf1, data = pima_train)$predictions
+
+# Using orginal labels
+preds2 <- factor(preds2, levels = c("NonDiabetic", "Diabetic"), 
+                 labels = c(0,1))
+preds2
+
+# Confusion matrix train set
+cm2 <- confusionMatrix(preds2, pima_train$Outcome)
+cm2
+
+# AUC
+preds2_auc <- predict(final_pima_rf2, data = pima_train)$predictions
+preds2_auc
+colnames(preds2_auc) <- c(0,1)
+
+roc_od2 <- roc(pima_train$Outcome, preds2_auc[, "1"],)
+roc_od2
+
+
+##################################
+
+# Feature Importance Random Forest
+
+# Importance values
+importance_values <- final_pima_rf1$variable.importance
+importance_values
+
+
+# Variable importance as data frame
+imp_rf <- data.frame(
+  Feature = names(final_pima_rf1$variable.importance),
+  Importance = final_pima_rf1$variable.importance
+)
+
+
+p1 <- ggplot(imp_rf, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "skyblue") +
+  coord_flip() +
+  labs(
+    title = "Random Forest",
+    x = "Feature", y = "Importance"
+  ) +
+  theme_minimal()  
+
+p1
+
+
+
+
+##############################################################################
+#
+# Hyperparametertuning XGboost
+#
+##############################################################################
+
+pima_train <- pima_data[train_indices, ]
+pima_test  <- pima_data[-train_indices, ]
+
+# For better reproducibility
+set.seed(123)
+
+# Convert Outcome to a factor with names
+pima_train$Outcome <- factor(
+  pima_train$Outcome,
+  levels = c(0, 1),  
+  labels = c("NonDiabetic", "Diabetic") 
+)
+
+pima_test$Outcome <- factor(
+  pima_test$Outcome,
+  levels = c(0, 1), 
+  labels = c("NonDiabetic", "Diabetic")
+)
+
+pima_train$Outcome
+pima_test$Outcome
+
+set.seed(123)
+# Hyperparameter grid for XGBoost 
+xgb_grid <- expand.grid(
+  nrounds = seq(10, 800, by = 10),           
+  max_depth = c(2, 3, 4),                
+  eta = c(0.01),         
+  gamma = c(0, 0.01, 0.05),         
+  colsample_bytree = 1,      
+  min_child_weight = c(15, 20 ,25),   
+  subsample = 1         
+)
+
+
+set.seed(123)
+# Hyperparameter grid for XGBoost 
+xgb_grid <- expand.grid(
+  nrounds = seq(10, 1000, by = 10),           
+  max_depth = c(2, 3),                
+  eta = c(0.01),         
+  gamma = c(0, 0.01),         
+  colsample_bytree = 1,      
+  min_child_weight = c(15, 20 ,25),   
+  subsample = 1         
+)
+
+xgb_grid
+
+
+# Cross-validation settings with 5 folds
+tc <- trainControl(method = "cv",                     
+                   number = 5,
+                   classProbs = TRUE,                
+                   summaryFunction = twoClassSummary, 
+                   verboseIter = FALSE)
+
+
+# Class weights train set
+w_train0 <- length(pima_train$Outcome)/
+                  (2 * sum(pima_train$Outcome != "Diabetic"))
+w_train1 <- length(pima_train$Outcome)/
+                  (2 * sum(pima_train$Outcome == "Diabetic"))
+
+w_train <- w_train1/w_train0
+
+
+# Class weights test data
+w_test0 <- length(pima_test$Outcome)/
+                 (2 * sum(pima_test$Outcome != "Diabetic"))
+w_test1 <- length(pima_test$Outcome)/
+                 (2 * sum(pima_test$Outcome == "Diabetic"))
+
+w_test <- w_test1/w_test0
+
+
+
+set.seed(123)
+# Train XGB with set grid
+xgb_model <- train(
+  Outcome ~ .,
+  data = pima_train,
+  method = "xgbTree",       
+  metric = "ROC",           
+  trControl = tc,           
+  tuneGrid = xgb_grid,     
+  scale_pos_weight = w_train,
+  seed = 123
+)
+
+xgb_grid$auc <- xgb_model$results$ROC
+xgb_grid
+
+
+# Rank models by AUC
+xgb_grid %>%
+  arrange(desc(auc)) %>%
+  head(50)
+
+
+##############################
+# Data preperation for XGBoost 
+
+# Original data
+pima_train <- pima_data[train_indices, ]
+pima_test  <- pima_data[-train_indices, ]
+
+
+# Convert to numeric
+pima_train$Outcome <- as.numeric(as.character(pima_train$Outcome))
+pima_train <- pima_train[sample(nrow(pima_train)), ]
+
+pima_test$Outcome <- as.numeric(as.character(pima_test$Outcome))
+pima_test <- pima_test[sample(nrow(pima_test)), ]
+
+
+# Training set
+xgb_prep <- recipe(Outcome ~ ., data = pima_train) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = pima_train, retain = TRUE) %>%
+  juice()
+
+X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "Outcome")])
+Y <- xgb_prep$Outcome
+X
+Y
+
+# Testing set
+xgb_prep2 <- recipe(Outcome ~ ., data = pima_test) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = pima_test, retain = TRUE) %>%
+  juice()
+
+X2 <- as.matrix(xgb_prep2[setdiff(names(xgb_prep2), "Outcome")])
+Y2 <- xgb_prep2$Outcome
+X2
+Y2
+
+##########################
+
+# Optimal parameter list
+params <- list(
+  eta = 0.01,
+  max_depth = 2,
+  min_child_weight = 20,
+  subsample = 1,
+  colsample_bytree = 1,
+  gamma = 0.01
+)
+
+set.seed(123)
+# Train final XGBoost model
+xgb.fit.final <- xgboost(
+  params = params,
+  data = X,
+  label = Y,
+  nrounds = 450,
+  scale_pos_weight = w_test,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+################################
+
+# Default model
+
+#set.seed(123)
+# Train final XGBoost model
+#xgb.fit.final <- xgboost(
+  #data = X,
+  #label = Y,
+  #nrounds = 100,
+  #objective = "binary:logistic",
+  #verbose = 0
+#)
+
+
+
+
+#############################
+# Feature Importance XGBoost
+
+# Get importance
+imp_matrix <- xgb.importance(model = xgb.fit.final)
+
+imp_matrix$Feature <- imp_matrix$Feature  
+imp_matrix <- imp_matrix[order(imp_matrix$Gain, decreasing = TRUE), ]
+p2 <- ggplot(imp_matrix[1:8, ], aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  coord_flip() +
+  labs(
+    title = "XGBoost",
+    x = "Feature", y = "Importance"
+  ) +
+  theme_minimal()
+
+p2
+
+#####################################
+
+# Prediction using test set
+pred3_p <- predict(xgb.fit.final, X2)
+pred3_p
+
+# Predictions over 0.5 will be class '1' for balanced data
+pred3 <-  as.numeric(pred3_p > 0.5)
+
+pred3 <- as.factor(pred3)
+pred3
+
+
+# Confusion matrix test set
+xgb_test <- as.factor(pima_test$Outcome)
+cm3 <- confusionMatrix(pred3, xgb_test)
+cm3
+
+
+# F1-score of test set
+precision <- cm3$byClass[3][1]    
+recall <- cm3$byClass[3][1]  
+F1 <- 2 * (precision * recall) / (precision + recall)
+names(F1) <- "F1"
+F1
+
+
+# AUC-ROC test
+roc_ox3 <- roc(xgb_test, pred3_p)
+roc_ox3
+
+# Plot ROC curve XGBoost
+plot(roc_ox3, 
+     main = "ROC Curves for XGBoost Model",
+     print.auc = TRUE, 
+     legacy.axes = TRUE)
+
+#######################################
+
+# Prediction using train set
+pred4_s <- predict(xgb.fit.final, X)
+pred4_s
+
+# Predictions over 0.5 will be class '1' for balanced data
+pred4 <-  as.numeric(pred4_s > 0.5)
+
+pred4 <- as.factor(pred4)
+pred4
+
+# Confusion matrix
+xgb_train <- as.factor(pima_train$Outcome)
+cm4 <- confusionMatrix(pred4, xgb_train)
+cm4
+
+# AUC-ROC train
+roc_ox4 <- roc(xgb_train, pred4_s)
+roc_ox4
+
+
+
+##############################
+# Plot ROC curve both models
+plot(roc_ox3, 
+     main = "ROC Curves: Random Forest vs XGBoost",
+     legacy.axes = TRUE, col = "blue")
+
+
+# Add the second ROC curve to the plot
+lines(roc_od, col = "red", lwd = 2)
+
+legend("bottomright",
+       legend = c(paste0("Random Forest (AUC = ", round(auc(roc_od), 4),")"),
+                  paste0("XGBoost (AUC = ", round(auc(roc_ox3), 4), ")")),
+       col = c("blue", "red"),
+       lwd = 2)
+
+
+# Both Feature Importance Plot
+p1 + p2 
+
+
+###########################################################################
+#
+# Overfitting analysis
+#
+###########################################################################
+# Random Forest
+
+# Test and Train
+pima_train <- pima_data[train_indices, ]
+pima_test  <- pima_data[-train_indices, ]
+
+# Convert Outcome to a factor with names
+pima_train$Outcome <- factor(
+  pima_train$Outcome,
+  levels = c(0, 1),  
+  labels = c("NonDiabetic", "Diabetic") 
+)
+
+pima_test$Outcome <- factor(
+  pima_test$Outcome,
+  levels = c(0, 1), 
+  labels = c("NonDiabetic", "Diabetic")
+)
+
+
+
+
+# Hyperparameter grid for Random Forest only using Number of trees
+rf_grid_over <- expand.grid(
+  mtry = 3,  
+  splitrule = "gini",       
+  min.node.size = 100,      
+  num.trees = seq(10, 2000, by = 10),
+  auc = NA,     # Track AUC for each combination
+)
+
+
+set.seed(123)
+# Loop with train()
+for (i in seq_len(nrow(rf_grid_over))) {
+  set.seed(123)
+  # Train model with current hyperparameters
+  fit <- train(
+    Outcome ~ .,
+    data = pima_train,
+    method = "ranger",
+    metric = "ROC",    # Optimize for "ROC"
+    tuneGrid = data.frame(                  
+      mtry = rf_grid_over$mtry[i],
+      splitrule = rf_grid_over$splitrule[i],
+      min.node.size = rf_grid_over$min.node.size[i]
+    ),
+    trControl = trainControl(
+      method = "cv",  # 5-fold cross-validation                     
+      number = 5,
+      classProbs = TRUE,    # for AUC                  
+      summaryFunction = twoClassSummary,   # for AUC  
+      verboseIter = FALSE
+    ),
+    num.trees = rf_grid_over$num.trees[i],
+    importance = "none",                   
+    class.weights = c(w_train0, w_train1),
+    seed = 123
+  )
+  
+  # Best AUC from cross-validation results
+  rf_grid_over$auc[i] <- max(fit$results$ROC)    # for AUC
+}
+
+
+
+numt <- seq(10, 2000, by = 10)
+
+auc_over <- c()
+acc_over <- c()
+
+
+# Getting train AUC for every number of tree
+for (i in 1:length(numt)){
+  
+  pima_train <- pima_data[train_indices, ]
+  pima_test  <- pima_data[-train_indices, ]
+  
+  
+  # Convert Outcome to a factor with names(string)
+  pima_train$Outcome <- factor(
+    pima_train$Outcome,
+    levels = c(0, 1),  
+    labels = c("NonDiabetic", "Diabetic") 
+  )
+  
+  pima_test$Outcome <- factor(
+    pima_test$Outcome,
+    levels = c(0, 1), 
+    labels = c("NonDiabetic", "Diabetic")
+  )
+  
+  final_pima_rf1 <- ranger(
+    formula         = Outcome ~ ., 
+    data            = pima_train, 
+    num.trees       = numt[i],  
+    mtry            = 3,
+    min.node.size   = 100,
+    class.weights = c(w_test0, w_test1),
+    #respect.unordered.factors = "order",
+    seed            = 123,
+    importance = "impurity"
+  )
+  
+  
+  # With class probability for AUC-ROC
+  final_pima_rf2 <- ranger(
+    formula         = Outcome ~ ., 
+    data            = pima_train, 
+    num.trees       = numt[i],
+    mtry            = 3,
+    min.node.size   = 100,
+    probability     = TRUE,
+    class.weights = c(w_test0, w_test1),
+    seed            = 123,
+    importance = "impurity"
+  )
+  
+  
+  pima_train <- pima_data[train_indices, ]
+  pima_test  <- pima_data[-train_indices, ]
+  
+  
+  # Prediction using train set
+  preds2 <- predict(final_pima_rf1, data = pima_train)$predictions
+  
+  # Using orginal labels
+  preds2 <- factor(preds2, levels = c("NonDiabetic", "Diabetic"), 
+                   labels = c(0,1))
+  
+  # Confusion matrix train set
+  cm2_over <- confusionMatrix(preds2, pima_train$Outcome)
+  acc_over[i] <- cm2_over$overall[1]
+  
+  # AUC
+  preds2_auc <- predict(final_pima_rf2, data = pima_train)$predictions
+  preds2_auc
+  colnames(preds2_auc) <- c(0,1)
+  
+  roc_od2_over <- roc(pima_train$Outcome, preds2_auc[, "1"],)
+  auc_over[i] <- roc_od2_over$auc
+  
+}
+
+# CV-AUC
+rf_grid_over$auc
+
+# Train AUC
+auc_over 
+
+
+min_auc <- min(min(auc_over), min(rf_grid_over$auc))
+max_auc <- max(max(auc_over), max(rf_grid_over$auc))
+
+# Plot CV vs. train AUC
+plot(numt, auc_over, type = "l", ylim = c(min_auc, max_auc),
+     main = "CV-AUC vs. Traning AUC Random Forest", col = "blue", lwd = 2)
+lines(rf_grid_over$num.trees, rf_grid_over$auc, type = "l", 
+      col = "red", lwd = 2)
+
+# Individual Plots
+plot(numt, auc_over, type = "l")
+plot(rf_grid_over$num.trees, rf_grid_over$auc, type = "l")
+
+
+#################################
+# Xgboost
+
+  
+# Hyperparameter grid for XGBoost for changing number of trees
+xgb_grid_over <- expand.grid(
+  nrounds = seq(10, 2000, by = 10),           
+  max_depth = 2,                
+  eta = 0.01,         
+  gamma = 0,         
+  colsample_bytree = 1,      
+  min_child_weight = 20,   # 1, 15, 20 ,25 
+  subsample = 1         
+)
+xgb_grid_over
+
+
+set.seed(123)
+# Train XGB with set grid
+xgb_model_over <- train(
+  Outcome ~ .,
+  data = pima_train,
+  method = "xgbTree",       
+  metric = "ROC",           
+  trControl = tc,           
+  tuneGrid = xgb_grid_over,     
+  scale_pos_weight = w_train,
+  seed = 123
+)
+
+
+rf_grid_over
+
+xgb_grid_over$auc <- xgb_model_over$results$ROC
+
+# Rank models by AUC
+xgb_grid_over %>%
+  arrange(desc(auc)) %>%
+  head(50)
+
+
+
+# Optimal parameter list
+params <- list(
+  eta = 0.01,
+  max_depth = 2,
+  min_child_weight = 20,
+  subsample = 1,
+  colsample_bytree = 1,
+  gamma = 0
+)
+
+
+numb <- seq(10, 2000, by = 10)
+auc_b <- c()
+
+
+# Original data
+pima_train <- pima_data[train_indices, ]
+pima_test  <- pima_data[-train_indices, ]
+
+
+# Convert to numeric
+pima_train$Outcome <- as.numeric(as.character(pima_train$Outcome))
+pima_train <- pima_train[sample(nrow(pima_train)), ]
+
+pima_test$Outcome <- as.numeric(as.character(pima_test$Outcome))
+pima_test <- pima_test[sample(nrow(pima_test)), ]
+
+
+# Getting the Train AUC for every number of tree
+for (i in 1:length(numb)){
+
+  set.seed(123)
+  # Train final XGBoost model
+  xgb.fit.final_o <- xgboost(
+    params = params,
+    data = X,
+    label = Y,
+    nrounds = numb[i],
+    scale_pos_weight = w_test,
+    objective = "binary:logistic",
+    verbose = 0
+  )
+
+  # Prediction using train set
+  pred4_o <- predict(xgb.fit.final_o, X)
+  pred4_o
+
+  # Predictions over 0.5 will be class '1' for balanced data
+  pred4 <-  as.numeric(pred4_o > 0.5)
+
+  pred4 <- as.factor(pred4)
+  pred4
+
+  # Confusion matrix
+  xgb_train <- as.factor(pima_train$Outcome)
+  cm4_o <- confusionMatrix(pred4, xgb_train)
+  cm4_o
+
+
+  auc_b[i] <- cm4_o$overall[1]
+
+}
+
+# Train AUC
+auc_b
+
+# CV AUC
+xgb_grid_over$auc
+
+
+# Individual Plot
+plot(xgb_grid_over$nrounds, xgb_grid_over$auc, type = "l")  
+plot(xgb_grid_over$nrounds, auc_b, type = "l")
+  
+
+max_auc_x <- max(max(xgb_grid_over$auc), max(auc_b))
+min_auc_x <- min(min(xgb_grid_over$auc), min(auc_b))
+  
+
+# Both Plots
+par(mfrow = c(1, 2))
+
+# Plot CV vs. train AUC Random Forest
+plot(numt, auc_over, type = "l", ylim = c(min_auc, max_auc),
+     main = "Random Forest",
+     xlab = "number of trees", ylab = "AUC",
+     col = "blue", lwd = 2)
+lines(rf_grid_over$num.trees, rf_grid_over$auc, type = "l", 
+      col = "red", lwd = 2)
+
+# # Plot CV vs. train AUC XGBoost
+plot(xgb_grid_over$nrounds, auc_b, type = "l", 
+     ylim = c(min_auc_x, max_auc_x), main = "XGBoost",
+     xlab = "number of trees", ylab = "AUC",
+     col = "blue",  lwd = 2)  
+lines(xgb_grid_over$nrounds, xgb_grid_over$auc, type = "l", 
+      col = "red", lwd = 2)
+  
+par(mfrow = c(1, 1))
+
+
+
+##############################################################################
+#
+# Missing data analysis
+#
+##############################################################################
+pima_data_missing <- read.csv("diabetes.csv", header = TRUE)
+pima_data_missing
+
+# 0 entries into NA
+pima_data_missing$Glucose[which(pima_data_missing$Glucose == 0)] <- NA
+pima_data_missing$BloodPressure[which(pima_data_missing$BloodPressure == 0)] <- NA
+pima_data_missing$BMI[which(pima_data_missing$BMI == 0)] <- NA
+pima_data_missing$SkinThickness[which(pima_data_missing$SkinThickness == 0)] <- NA
+pima_data_missing$Insulin[which(pima_data_missing$Insulin == 0)] <- NA
+
+pima_data_missing$Outcome <- factor(pima_data_missing$Outcome)
+
+# T>est and Train
+pima_train_miss <- pima_data_missing[train_indices, ]
+pima_test_miss  <- pima_data_missing[-train_indices, ]
+
+
+# Convert Outcome to a factor with names(string)
+pima_train_miss$Outcome <- factor(
+  pima_train$Outcome,
+  levels = c(0, 1),  
+  labels = c("NonDiabetic", "Diabetic") 
+)
+
+pima_test_miss$Outcome <- factor(
+  pima_test$Outcome,
+  levels = c(0, 1), 
+  labels = c("NonDiabetic", "Diabetic")
+)
+
+pima_train_miss$Outcome
+pima_test_miss$Outcome
+
+##################################
+# Random Forest Missing Data
+
+# Final Random Forest model with missing data
+final_pima_rf3 <- ranger(
+  formula         = Outcome ~ ., 
+  data            = pima_train_miss, 
+  num.trees       = 100,  
+  mtry            = 3,
+  min.node.size   = 100,
+  class.weights = c(w_test0, w_test1),
+  #respect.unordered.factors = "order",
+  seed            = 123,
+  importance = "impurity"
+)
+
+# With class probability for AUC-ROC
+final_pima_rf4 <- ranger(
+  formula         = Outcome ~ ., 
+  data            = pima_train_miss, 
+  num.trees       = 100,
+  mtry            = 3,
+  min.node.size   = 100,
+  probability     = TRUE,
+  class.weights = c(w_test0, w_test1),
+  seed            = 123,
+  importance = "impurity"
+)
+
+
+final_pima_rf3
+final_pima_rf4
+
+
+
+# Using orginal data with orginal labels for Outcome
+pima_train_miss <- pima_data_missing[train_indices, ]
+pima_test_miss  <- pima_data_missing[-train_indices, ]
+
+
+##############################
+# Prediction using test set
+preds1_miss <- predict(final_pima_rf3, data = pima_test_miss)$predictions
+
+# Using orginal labels
+preds1_miss <- factor(preds1_miss, levels = c("NonDiabetic", "Diabetic"), 
+                      labels = c(0,1))
+
+preds1_miss
+# Confusion matrix test set
+cm_miss <- confusionMatrix(preds1_miss, pima_test_miss$Outcome)
+cm_miss
+
+
+# F1-score of test set
+precision <- cm_miss$byClass[3][1]    #
+recall <- cm_miss$byClass[3][1]       
+F1 <- 2 * (precision * recall) / (precision + recall)
+names(F1) <- "F1"
+F1
+
+# AUC-ROC using class probability
+preds_auc_miss <- predict(final_pima_rf4, data = pima_test_miss)$predictions
+preds_auc_miss
+
+colnames(preds_auc_miss) <- c(0,1)
+
+roc_od_miss <- roc(pima_test_miss$Outcome, preds_auc_miss[, "1"],)
+roc_od_miss
+
+
+###############################
+# Prediction using train set
+preds2_miss <- predict(final_pima_rf3, data = pima_train_miss)$predictions
+
+# Using orginal labels
+preds2_miss <- factor(preds2_miss, levels = c("NonDiabetic", "Diabetic"), 
+                      labels = c(0,1))
+preds2_miss
+
+# Confusion matrix train set
+cm2_miss <- confusionMatrix(preds2_miss, pima_train_miss$Outcome)
+cm2_miss
+
+# AUC
+preds2_auc_m <- predict(final_pima_rf4, data = pima_train_miss)$predictions
+preds2_auc_m
+colnames(preds2_auc_m) <- c(0,1)
+
+roc_od2_miss <- roc(pima_train_miss$Outcome, preds2_auc_m[, "1"],)
+roc_od2_miss
+
+
+#####################################
+# XGBoost
+
+# Test and Train
+pima_train_miss <- pima_data_missing[train_indices, ]
+pima_test_miss  <- pima_data_missing[-train_indices, ]
+
+
+# Convert to numeric
+pima_train_miss$Outcome <- as.numeric(as.character(pima_train_miss$Outcome))
+pima_train_miss <- pima_train_miss[sample(nrow(pima_train_miss)), ]
+
+pima_test_miss$Outcome <- as.numeric(as.character(pima_test_miss$Outcome))
+pima_test_miss <- pima_test_miss[sample(nrow(pima_test_miss)), ]
+
+
+
+# Data preperation for XGBoost 
+
+# Training set
+xgb_prep_m <- recipe(Outcome ~ ., data = pima_train_miss) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = pima_train_miss, retain = TRUE) %>%
+  juice()
+
+X_m <- as.matrix(xgb_prep_m[setdiff(names(xgb_prep_m), "Outcome")])
+Y_m <- xgb_prep_m$Outcome
+X_m
+Y_m
+
+# Testing set
+xgb_prep2_m <- recipe(Outcome ~ ., data = pima_test_miss) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = pima_test_miss, retain = TRUE) %>%
+  juice()
+
+X2_m <- as.matrix(xgb_prep2_m[setdiff(names(xgb_prep2_m), "Outcome")])
+Y2_m <- xgb_prep2_m$Outcome
+X2_m
+Y2_m
+
+
+# Optimal parameter list
+params <- list(
+  eta = 0.01,
+  max_depth = 2,
+  min_child_weight = 20,
+  subsample = 1,
+  colsample_bytree = 1,
+  gamma = 0
+)
+
+set.seed(123)
+# Train final XGBoost model
+xgb.fit.final_miss <- xgboost(
+  params = params,
+  data = X_m,
+  label = Y_m,
+  nrounds = 450,
+  scale_pos_weight = w_test,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+##############################
+# Prediction using test set
+pred3_p_miss <- predict(xgb.fit.final_miss, X2_m)
+pred3_p_miss
+
+# Predictions over 0.5 will be class '1' for balanced data
+pred3_miss <-  as.numeric(pred3_p_miss > 0.5)
+
+pred3_miss <- as.factor(pred3_miss)
+pred3_miss
+
+
+# Confusion matrix test set
+xgb_test_miss <- as.factor(pima_test_miss$Outcome)
+cm3_miss <- confusionMatrix(pred3_miss, xgb_test_miss)
+cm3_miss
+
+# F1-score of test set
+precision <- cm3_miss$byClass[3][1]    
+recall <- cm3_miss$byClass[3][1]  
+F1 <- 2 * (precision * recall) / (precision + recall)
+names(F1) <- "F1"
+F1
+
+# AUC-ROC test
+roc_ox3 <- roc(xgb_test, pred3_p)
+roc_ox3
+
+
+###################################
+# Prediction using train set
+pred4_s_miss <- predict(xgb.fit.final_miss, X_m)
+pred4_s_miss
+
+# Predictions over 0.5 will be class '1' for balanced data
+pred4_miss <-  as.numeric(pred4_s_miss > 0.5)
+
+pred4_miss <- as.factor(pred4_miss)
+pred4_miss
+
+# Confusion matrix
+xgb_train_miss <- as.factor(pima_train_miss$Outcome)
+cm4_miss <- confusionMatrix(pred4_miss, xgb_train_miss)
+cm4_miss
+
+# AUC-ROC train
+roc_ox4_miss <- roc(xgb_train_miss, pred4_s_miss)
+roc_ox4_miss
+
+
+#############################
+
+
+
+
+
+
+
